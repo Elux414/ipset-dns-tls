@@ -1,9 +1,8 @@
-/* ipset-dns: lightweight DNS IPSet forwarding server
- * by Jason A. Donenfeld (zx2c4) <Jason@zx2c4.com>
+/* ipset-dns-tls: lightweight DNS IPSet forwarding server with secure resolving
+ * by Elux414
  *
- * This is a lightweight DNS forwarding server that adds all resolved IPs
- * to a given netfilter ipset. It is designed to be used in conjunction with
- * dnsmasq's upstream server directive.
+ * Based on ipset-dns by Jason A. Donenfeld (zx2c4) <Jason@zx2c4.com>
+ * https://git.zx2c4.com/ipset-dns
  *
  * Copyright (C) 2013, 2017 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
  * DNS parsing code loosely based on uClibc's resolv.c:
@@ -11,28 +10,8 @@
  * Copyright (C) 1985, 1993 The Regents of the University of California. All Rights Reserved.
  * This file is licensed under the GPLv2. Please see COPYING for more information.
  *
- * 
- * Usage Example:
- * 
- * In dnsmasq.conf:
- *     server=/c.youtube.com/127.0.0.1#1919
- * Make an ipset:
- *     # ipset -N youtube iphash
- * Start the ipset-dns server:
- *     # ipset-dns youtube "" 1919 8.8.8.8
- * Query a hostname:
- *     # host r4---bru02t12.c.youtube.com
- *     r4---bru02t12.c.youtube.com is an alias for r4.bru02t12.c.youtube.com.
- *     r4.bru02t12.c.youtube.com has address 74.125.216.51
- * Observe that it was added to the ipset:
- *     # ipset -L youtube
- *     Name: youtube
- *     Type: iphash
- *     References: 1
- *     Header: hashsize: 1024 probes: 8 resize: 50
- *     Members:
- *     74.125.216.51
- */   
+ * Modified by Elux414 on 2026-10-25: added DoH transport via libcurl.
+ */
 
 
 #include <stdlib.h>
@@ -43,6 +22,7 @@
 #include <sys/socket.h>
 #include <arpa/nameser.h>
 #include <arpa/inet.h>
+#include <curl/curl.h>
 #ifndef OLD_IPSET
 #include <libmnl/libmnl.h>
 #include <linux/netfilter/nfnetlink.h>
@@ -299,13 +279,74 @@ close:
 #endif
 }
 
+struct doh_response {
+	unsigned char *data;
+	size_t len;
+};
+
+static size_t doh_write_cb(void *contents, size_t size, size_t nmemb, void *userp)
+{
+	size_t realsize = size * nmemb;
+	struct doh_response *mem = (struct doh_response *)userp;
+
+	unsigned char *ptr = realloc(mem->data, mem->len + realsize);
+	if (!ptr)
+		return 0;
+
+	mem->data = ptr;
+	memcpy(&(mem->data[mem->len]), contents, realsize);
+	mem->len += realsize;
+	return realsize;
+}
+
+static int doh_query(const char *url, const unsigned char *query, size_t query_len,
+					 unsigned char **response, size_t *response_len)
+{
+	CURL *curl;
+	CURLcode res;
+	struct doh_response chunk = { NULL, 0 };
+	struct curl_slist *headers = NULL;
+	int ret = -1;
+
+	curl = curl_easy_init();
+	if (!curl)
+		return -1;
+
+	headers = curl_slist_append(headers, "Content-Type: application/dns-message");
+	headers = curl_slist_append(headers, "Accept: application/dns-message");
+
+	curl_easy_setopt(curl, CURLOPT_URL, url);
+	curl_easy_setopt(curl, CURLOPT_POST, 1L);
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, query);
+	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)query_len);
+	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
+	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, doh_write_cb);
+	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
+	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
+	curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
+
+	res = curl_easy_perform(curl);
+	if (res == CURLE_OK) {
+		*response = chunk.data;
+		*response_len = chunk.len;
+		ret = 0;
+	} else {
+		free(chunk.data);
+		fprintf(stderr, "DoH query failed: %s\n", curl_easy_strerror(res));
+	}
+
+	curl_slist_free_all(headers);
+	curl_easy_cleanup(curl);
+	return ret;
+}
+
 int main(int argc, char *argv[]) 
 {
 	struct sockaddr_in client_addr, listen_addr, upstream_addr;
 	struct resolv_header question_header, answer_header;
 	struct resolv_answer answer;
 	struct timeval tv;
-	char msg[512];
+	char msg[4096];
 	char ip[INET6_ADDRSTRLEN];
 	char *ipset4, *ipset6;
 	int listen_sock, upstream_sock;
@@ -318,6 +359,8 @@ int main(int argc, char *argv[])
 		fprintf(stderr, "Usage: %s ipv4-ipset ipv6-ipset port upstream\n", argv[0]);
 		return 1;
 	}
+
+	curl_global_init(CURL_GLOBAL_DEFAULT);
 
 	ipset4 = argv[1];
 	ipset6 = argv[2];
@@ -377,29 +420,44 @@ int main(int argc, char *argv[])
 
 		decode_header(msg, &question_header);
 
-		upstream_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-		if (upstream_sock < 0) {
-			perror("socket");
-			continue;
+		if (strncmp(argv[4], "https://", 8) == 0) {
+			unsigned char *doh_resp = NULL;
+			size_t doh_len = 0;
+			if (doh_query(argv[4], (unsigned char *)msg, received, &doh_resp, &doh_len) < 0)
+				continue;
+			if (doh_len > sizeof(msg)) {
+				free(doh_resp);
+				fprintf(stderr, "DoH response too large.\n");
+				continue;
+			}
+			memcpy(msg, doh_resp, doh_len);
+			received = doh_len;
+			free(doh_resp);
+		} else {
+			upstream_sock = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+			if (upstream_sock < 0) {
+				perror("socket");
+				continue;
+			}
+			tv.tv_sec = 1;
+			tv.tv_usec = 0;
+			setsockopt(upstream_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+			if (sendto(upstream_sock, msg, received, 0, (struct sockaddr *)&upstream_addr, sizeof(upstream_addr)) < 0) {
+				perror("sendto");
+				continue;
+			}
+			received = recv(upstream_sock, msg, sizeof(msg), 0);
+			if (received < 0) {
+				perror("recv");
+				continue;
+			}
+			if (received < HFIXEDSZ) {
+				fprintf(stderr, "Did not receive full DNS header from upstream.\n");
+				continue;
+			}
+			close(upstream_sock);
+			upstream_sock = -1;
 		}
-		tv.tv_sec = 1;
-		tv.tv_usec = 0;
-		setsockopt(upstream_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-		if (sendto(upstream_sock, msg, received, 0, (struct sockaddr *)&upstream_addr, sizeof(upstream_addr)) < 0) {
-			perror("sendto");
-			continue;
-		}
-		received = recv(upstream_sock, msg, sizeof(msg), 0);
-		if (received < 0) {
-			perror("recv");
-			continue;
-		}
-		if (received < HFIXEDSZ) {
-			fprintf(stderr, "Did not receive full DNS header from upstream.\n");
-			continue;
-		}
-		close(upstream_sock);
-		upstream_sock = -1;
 
 		decode_header(msg, &answer_header);
 		if (answer_header.id != question_header.id || !answer_header.qr) {
