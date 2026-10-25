@@ -299,33 +299,43 @@ static size_t doh_write_cb(void *contents, size_t size, size_t nmemb, void *user
 	return realsize;
 }
 
+static CURL *g_curl_handle = NULL;
+
 static int doh_query(const char *url, const unsigned char *query, size_t query_len,
 					 unsigned char **response, size_t *response_len)
 {
-	CURL *curl;
 	CURLcode res;
 	struct doh_response chunk = { NULL, 0 };
 	struct curl_slist *headers = NULL;
 	int ret = -1;
 
-	curl = curl_easy_init();
-	if (!curl)
-		return -1;
+	/* Ленивая инициализация: создаём handle один раз на весь процесс */
+	if (!g_curl_handle) {
+		g_curl_handle = curl_easy_init();
+		if (!g_curl_handle)
+			return -1;
+		/* Включаем keep-alive, чтобы TCP/TLS соединение не рвалось между запросами */
+		curl_easy_setopt(g_curl_handle, CURLOPT_TCP_KEEPALIVE, 1L);
+	} else {
+		/* Сбрасываем опции предыдущего запроса, но сохраняем живое соединение */
+		curl_easy_reset(g_curl_handle);
+		curl_easy_setopt(g_curl_handle, CURLOPT_TCP_KEEPALIVE, 1L);
+	}
 
 	headers = curl_slist_append(headers, "Content-Type: application/dns-message");
 	headers = curl_slist_append(headers, "Accept: application/dns-message");
 
-	curl_easy_setopt(curl, CURLOPT_URL, url);
-	curl_easy_setopt(curl, CURLOPT_POST, 1L);
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDS, query);
-	curl_easy_setopt(curl, CURLOPT_POSTFIELDSIZE, (long)query_len);
-	curl_easy_setopt(curl, CURLOPT_HTTPHEADER, headers);
-	curl_easy_setopt(curl, CURLOPT_WRITEFUNCTION, doh_write_cb);
-	curl_easy_setopt(curl, CURLOPT_WRITEDATA, (void *)&chunk);
-	curl_easy_setopt(curl, CURLOPT_TIMEOUT, 5L);
-	curl_easy_setopt(curl, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
+	curl_easy_setopt(g_curl_handle, CURLOPT_URL, url);
+	curl_easy_setopt(g_curl_handle, CURLOPT_POST, 1L);
+	curl_easy_setopt(g_curl_handle, CURLOPT_POSTFIELDS, query);
+	curl_easy_setopt(g_curl_handle, CURLOPT_POSTFIELDSIZE, (long)query_len);
+	curl_easy_setopt(g_curl_handle, CURLOPT_HTTPHEADER, headers);
+	curl_easy_setopt(g_curl_handle, CURLOPT_WRITEFUNCTION, doh_write_cb);
+	curl_easy_setopt(g_curl_handle, CURLOPT_WRITEDATA, (void *)&chunk);
+	curl_easy_setopt(g_curl_handle, CURLOPT_TIMEOUT, 5L);
+	curl_easy_setopt(g_curl_handle, CURLOPT_HTTP_VERSION, CURL_HTTP_VERSION_2_0);
 
-	res = curl_easy_perform(curl);
+	res = curl_easy_perform(g_curl_handle);
 	if (res == CURLE_OK) {
 		*response = chunk.data;
 		*response_len = chunk.len;
@@ -336,7 +346,7 @@ static int doh_query(const char *url, const unsigned char *query, size_t query_l
 	}
 
 	curl_slist_free_all(headers);
-	curl_easy_cleanup(curl);
+	/* ВАЖНО: curl_easy_cleanup(g_curl_handle) здесь НЕ вызываем! */
 	return ret;
 }
 
