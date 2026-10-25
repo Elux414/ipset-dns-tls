@@ -1,138 +1,70 @@
-# ipset-dns
-#### Jason A. Donenfeld (<Jason@zx2c4.com>)
+# ipset-dns-tls
 
-`ipset-dns` is a lightweight DNS forwarding server that adds all resolved IPs
-to a given [netfilter ipset](http://ipset.netfilter.org/). It is designed to be
-used in conjunction with [`dnsmasq`](http://www.thekelleys.org.uk/dnsmasq/doc.html)'s
-upstream server directive.
+A lightweight DNS forwarding server that adds all resolved IPs to a given netfilter ipset, supporting **encrypted DNS (DoH)** to bypass plaintext DNS interception.
 
-Practical use cases include routing over a given gateway traffic for particular
-web services or webpages that do not have a priori predictable IP addresses and
-instead rely on dizzying arrays of DNS resolutions.
+This is a fork of the original [ipset-dns](https://git.zx2c4.com/ipset-dns/about/) project by Jason A. Donenfeld (zx2c4), which adds support for secure DNS resolution. 
 
-#### Upstream Dnsmasq Support
+### Why this fork?
 
-***This functionality has now been [written directly into `dnsmasq`](http://thekelleys.org.uk/gitweb/?p=dnsmasq.git;a=commit;h=13d86c7372e01392d1e3af7c90312b49e2a5c15d), which should be much easier to use than this project. See the `--ipset` option.***
+The original `ipset-dns` relies on plaintext UDP DNS (port 53). In some regions (like Russia), plaintext DNS queries are intercepted, spoofed, or blocked (e.g., by DPI). This results in `NXDOMAIN` responses for certain domains, breaking the ipset routing logic.
 
+This fork solves the problem by adding **DNS over HTTPS (DoH)** support. It securely resolves domains and successfully populates the ipset, even when plaintext DNS is blocked.
 
-### Why?
+### Features
 
-Some ISPs throttle connections to services like YouTube. Other times,
-you live places where there's no Netflix/Pandora/Hulu, but you've got a VPN.
-
-The problem is, you don't want to route *all* your internet traffic over VPN -- just
-for YouTube and Pandora, say. It'd be nice to just whitelist a static IP range,
-but some services, like YouTube, have a thousands of caching servers in a modicum
-of IP ranges, and it's just too much of a hassle to compile the list beforehand.
-
-So instead, you put `ipset-dns` on your router, and then everyone and every
-XBox/PS3/whatever on your wifi network will benefit from the superior
-bandwidth and/or geo-availability.
+*   **DoH Support**: Route queries through `https://cloudflare-dns.com/dns-query` or any other DoH provider.
+*   **CURL Handle Reuse**: The TLS connection is kept alive between queries, reducing CPU load and latency.
+*   **Backwards Compatible**: Plain UDP DNS is still supported. If you pass an IP as the upstream, it falls back to the original UDP behavior.
+*   **Lightweight**: Fully compatible with OpenWrt and other embedded Linux systems.
 
 ### Usage
 
-    # ipset-dns name-of-v4-ipset name-of-v6-ipset listening-port upstream-dns-server
+    ipset-dns-tls ipv4-ipset ipv6-ipset port upstream
 
-`ipset-dns` binds only to localhost. It will daemonize unless the `NO_DAEMONIZE`
-environment variable is set. If either `name-of-v4-ipset` or `name-of-v6-ipset` are
-empty strings, then the ipset for the respective address family will not be utilized.
+*   `ipv4-ipset`: Name of the ipset for A records (or `""` to disable).
+*   `ipv6-ipset`: Name of the ipset for AAAA records (or `""` to disable).
+*   `port`: Local UDP port to listen on.
+*   `upstream`: DoH URL (e.g., `https://cloudflare-dns.com/dns-query`) or legacy DNS IP (e.g., `8.8.8.8`).
 
-### Building
+**Example (DoH):**
 
-Linux >= 2.6.32:
+    ipset-dns-tls youtube "" 53001 https://cloudflare-dns.com/dns-query
 
-    $ make
+**Example (Legacy UDP):**
 
-Linux >= 2.6.16 or >= 2.4.36:
+    ipset-dns-tls youtube "" 53001 8.8.8.8
 
-    $ make OLD_IPSET=1
+### OpenWrt Integration
 
-### Example
+The repository includes a ready-to-use OpenWrt package. 
 
-In `dnsmasq.conf`:
+1. Copy the `ipset-dns-tls-openwrt` folder to your OpenWrt `package/` directory (or use it as a feed).
+2. Compile it using the OpenWrt SDK.
+3. Install the `.ipk/.apk` on your router.
 
-	server=/c.youtube.com/127.0.0.1#1919
+**Configuration (`/etc/config/ipset-dns-tls`):**
 
-Make an ipset:
+    config ipset-dns-tls
+        option ipset 'domain-filter-ipv4'
+        option ipset6 'domain-filter-ipv6'
+        option port '53001'
+        option dns 'https://cloudflare-dns.com/dns-query'
 
-	# ipset -N youtube iphash
+**Start the service:**
 
-Start the `ipset-dns` server:
+    /etc/init.d/ipset-dns-tls start
 
-	# ipset-dns youtube 1919 8.8.8.8
+### Building from source (Linux)
 
-Query a hostname:
+Dependencies: `libcurl`, `libmnl`.
 
-	# host r4---bru02t12.c.youtube.com
-	r4---bru02t12.c.youtube.com is an alias for r4.bru02t12.c.youtube.com.
-	r4.bru02t12.c.youtube.com has address 74.125.216.51
-
-Observe that it was added to the ipset:
-
-	# ipset -L youtube
-	Name: youtube
-	Type: iphash
-	References: 1
-	Header: hashsize: 1024 probes: 8 resize: 50
-	Members:
-	74.125.216.51
-
-
-### Sample Script
-
-The following script routes youtube and netflix over two different repective
-gateways. It assumes you're using `dnsmasq` or similar to manage caching and
-selectively using upstream servers:
-
-	server=/c.youtube.com/127.0.0.1#39128
-	server=/netflix.com/127.0.0.1#39129
-
-The network interfaces `tun11` and `tun12` are assumed to be OpenVPN tunnels,
-though they may be any other kind of interface with a route. These devices are
-assumed to have some form of masquerading and IP forwarding turned on already.
-
-The `mangle` `iptables` table is used to set a firewall mark on packets that
-match an ipset tended to by `ipset-dns`. A routing table is created and a rule
-is entered that sends packets marked by `iptables` to the correct routing table.
-Finally, a default route is given to the marked routing table.
-
-Two `ipset-dns` daemons are started, one for each of the routes, using the ports
-given by `dnsmasq`. Lastly, `SIGHUP` is sent to `dnsmasq` to flush its cache.
-
-	sets() {
-		iptables -t mangle -D PREROUTING -m set --set "$1" dst,src -j MARK --set-mark "$2" 2>/dev/null
-		ipset -X "$1" 2>/dev/null
-		ipset -N "$1" iphash
-		iptables -t mangle -A PREROUTING -m set --set "$1" dst,src -j MARK --set-mark "$2"
-	}
-
-	sets youtube 1
-	sets netflix 2
-
-	routes() {
-		echo 0 > /proc/sys/net/ipv4/conf/$2/rp_filter
-		ip route flush table $1 2>/dev/null
-		ip rule del table $1 2>/dev/null
-		ip rule add fwmark $1 table $1 priority 1000
-		ip route add default via "$(ip route show dev $2 | head -n 1 | cut -d ' ' -f 1)" table $1
-	}
-
-	routes 1 tun12
-	routes 2 tun11
-
-	killall ipset-dns 2>/dev/null
-	ipset-dns youtube 39128 8.8.8.8
-	ipset-dns netflix 39129 8.8.8.8
-
-	killall -SIGHUP dnsmasq
+    make
+    sudo make install
 
 ### License
 
-* Copyright (C) 2013, 2017 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+This project is licensed under the GPLv2. See `COPYING` for details.
 
-DNS parsing code loosely based on uClibc's [resolv.c](http://git.uclibc.org/uClibc/tree/libc/inet/resolv.c):
-
-* Copyright (C) 1998 Kenneth Albanowski <kjahds@kjahds.com>, The Silver Hammer Group, Ltd.
-* Copyright (C) 1985, 1993 The Regents of the University of California. All Rights Reserved.
-
-This project is licensed under the GPLv2. Please see COPYING for more information.
+*   Copyright (C) 2013, 2017 Jason A. Donenfeld <Jason@zx2c4.com>. All Rights Reserved.
+*   DNS parsing code loosely based on uClibc's `resolv.c` (Copyright (C) 1998 Kenneth Albanowski, The Silver Hammer Group, Ltd.; Copyright (C) 1985, 1993 The Regents of the University of California).
+*   Modified by Elux414 (2026): Added DoH transport via libcurl.
